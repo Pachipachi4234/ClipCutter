@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>ClipCutter | 自動無音カットツール</title>
+    <title>ClipCutter | 自動無音カットツール (WebCodecs爆速版)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { background-color: #0d1117; color: #c9d1d9; font-family: sans-serif; }
@@ -13,8 +13,8 @@
 </head>
 <body class="min-h-screen p-6 space-y-6 max-w-5xl mx-auto">
     <header class="border-b border-[#30363d] pb-4">
-        <h1 class="text-3xl font-bold text-[#58a6ff]">ClipCutter <span class="text-sm font-normal text-gray-400">by YuJitsu</span></h1>
-        <p class="text-[#8b949e] mt-2">動画の無音部分を自動検知し、必要な部分だけを繋ぎ合わせた動画（MP4）を高速で生成します。</p>
+        <h1 class="text-3xl font-bold text-[#58a6ff]">ClipCutter <span class="text-sm font-normal text-gray-400">by YuJitsu · WebCodecs Turbo</span></h1>
+        <p class="text-[#8b949e] mt-2">動画の無音部分を自動検知し、WebCodecs（GPU直接エンコード）で待ち時間なく爆速MP4生成します。</p>
     </header>
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -57,11 +57,25 @@
             </div>
 
             <div class="panel">
-                <h2 class="text-lg font-bold mb-2 text-[#79c0ff]">② カット動画の書き出し</h2>
-                <p class="text-xs text-gray-400 mb-4">解析結果をもとに、無音を飛ばしながら録画して1本のMP4にします。</p>
+                <h2 class="text-lg font-bold mb-2 text-[#79c0ff]">② カット動画の爆速書き出し</h2>
+                <p class="text-xs text-gray-400 mb-3">等倍再生を待たず、GPUハードウェアエンコードで一気にMP4を出力します。</p>
+                <div class="mb-3">
+                    <label class="block text-xs mb-1 text-gray-300">出力フレームレート (FPS)</label>
+                    <select id="exportFps" class="input-ui text-sm">
+                        <option value="30" selected>30 FPS（標準・高速）</option>
+                        <option value="24">24 FPS（さらに爆速）</option>
+                        <option value="60">60 FPS（ぬるぬる高画質）</option>
+                    </select>
+                </div>
                 <button id="exportBtn" class="bg-[#8957e5] hover:bg-[#9d6cfa] text-white px-4 py-3 rounded-md font-bold w-full transition disabled:opacity-50" disabled>
-                    MP4で書き出す
+                    ⚡ WebCodecsで爆速MP4書き出し
                 </button>
+                <div id="exportProgressWrap" class="hidden mt-3">
+                    <div class="w-full bg-[#010409] rounded-full h-2.5 border border-[#30363d] overflow-hidden">
+                        <div id="exportProgressBar" class="bg-[#8957e5] h-2.5 transition-all duration-75" style="width: 0%"></div>
+                    </div>
+                    <div id="exportProgressText" class="text-xs text-[#79c0ff] mt-1 font-mono">0%</div>
+                </div>
             </div>
         </div>
 
@@ -71,7 +85,6 @@
                 <h2 class="text-lg font-bold mb-4 text-[#79c0ff]">プレビュー</h2>
                 <div class="w-full aspect-video bg-black rounded-lg overflow-hidden border border-[#30363d] relative">
                     <video id="videoPlayer" class="w-full h-full object-contain"></video>
-                    <!-- 書き出し用非表示キャンバス -->
                     <canvas id="exportCanvas" class="hidden"></canvas>
                 </div>
                 
@@ -96,8 +109,9 @@
         </div>
     </div>
 
-<script>
-    // UI Elements
+<script type="module">
+    import { Muxer, ArrayBufferTarget } from 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/+esm';
+
     const el = {
         input: document.getElementById('mediaInput'),
         threshold: document.getElementById('threshold'),
@@ -105,7 +119,11 @@
         minSilence: document.getElementById('minSilence'),
         padding: document.getElementById('padding'),
         analyzeBtn: document.getElementById('analyzeBtn'),
+        exportFps: document.getElementById('exportFps'),
         exportBtn: document.getElementById('exportBtn'),
+        exportProgressWrap: document.getElementById('exportProgressWrap'),
+        exportProgressBar: document.getElementById('exportProgressBar'),
+        exportProgressText: document.getElementById('exportProgressText'),
         previewBtn: document.getElementById('previewBtn'),
         video: document.getElementById('videoPlayer'),
         canvas: document.getElementById('exportCanvas'),
@@ -121,10 +139,8 @@
     let isExporting = false;
     let mediaUrl = null;
 
-    // スライダー連動
     el.threshold.addEventListener('input', (e) => { el.thresholdVal.innerText = e.target.value + 'dB'; });
 
-    // 動画読み込み
     el.input.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if(!file) return;
@@ -134,11 +150,11 @@
         
         el.video.onloadedmetadata = () => {
             el.origTime.innerText = el.video.duration.toFixed(1);
-            el.canvas.width = el.video.videoWidth;
-            el.canvas.height = el.video.videoHeight;
+            // H.264は幅・高さが偶数である必要があるため偶数丸め
+            el.canvas.width = el.video.videoWidth % 2 === 0 ? el.video.videoWidth : el.video.videoWidth - 1;
+            el.canvas.height = el.video.videoHeight % 2 === 0 ? el.video.videoHeight : el.video.videoHeight - 1;
         };
 
-        // 音声データを解析用にデコード
         el.status.classList.remove('hidden');
         el.status.innerText = "⏳ 音声データを準備中...";
         el.analyzeBtn.disabled = true;
@@ -146,12 +162,12 @@
         const arrayBuffer = await file.arrayBuffer();
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
         audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        await ctx.close();
         
         el.status.innerText = "✅ 準備完了！解析できます。";
         el.analyzeBtn.disabled = false;
     });
 
-    // 解析処理 (無音検知)
     el.analyzeBtn.addEventListener('click', () => {
         if(!audioBuffer) return;
         el.status.innerText = "✨ 解析中...";
@@ -159,16 +175,15 @@
         const data = audioBuffer.getChannelData(0);
         const sampleRate = audioBuffer.sampleRate;
         const dbThreshold = parseFloat(el.threshold.value);
-        const ampThreshold = Math.pow(10, dbThreshold / 20); // dB to Amplitude
+        const ampThreshold = Math.pow(10, dbThreshold / 20);
         const minSilenceFrames = parseFloat(el.minSilence.value) * sampleRate;
         const padFrames = parseFloat(el.padding.value) * sampleRate;
         
-        const chunkSize = Math.floor(sampleRate * 0.05); // 0.05秒ごとの塊で判定
+        const chunkSize = Math.floor(sampleRate * 0.05);
         let silentRegions = [];
         let isSilent = false;
         let silentStart = 0;
 
-        // RMS(音量)を計算して無音区間をざっくり出す
         for(let i=0; i<data.length; i+=chunkSize) {
             let sum = 0;
             for(let j=0; j<chunkSize && i+j<data.length; j++) { sum += data[i+j] * data[i+j]; }
@@ -186,7 +201,6 @@
         }
         if(isSilent && data.length - silentStart >= minSilenceFrames) silentRegions.push({start: silentStart, end: data.length});
 
-        // 無音区間を反転させて「残す部分（有音）」を作り、余白(padding)を足す
         keepSegments = [];
         let currentStart = 0;
         for(let reg of silentRegions) {
@@ -198,7 +212,6 @@
         let finalStart = Math.max(0, currentStart - padFrames);
         if(finalStart < data.length) keepSegments.push({start: finalStart/sampleRate, end: audioBuffer.duration});
 
-        // プレビュー表示更新
         let totalNewTime = 0;
         el.segList.innerHTML = '';
         keepSegments.forEach((seg, i) => {
@@ -212,15 +225,14 @@
         el.exportBtn.disabled = false;
     });
 
-    // プレビュー再生コントロール
     let currentSegIndex = 0;
     el.video.addEventListener('timeupdate', () => {
-        if((isPreviewing || isExporting) && keepSegments.length > 0) {
+        if(isPreviewing && keepSegments.length > 0) {
             let seg = keepSegments[currentSegIndex];
-            if(el.video.currentTime >= seg.end) {
+            if(!seg || el.video.currentTime >= seg.end) {
                 currentSegIndex++;
                 if(currentSegIndex < keepSegments.length) {
-                    el.video.currentTime = keepSegments[currentSegIndex].start; // 次の有音へジャンプ
+                    el.video.currentTime = keepSegments[currentSegIndex].start;
                 } else {
                     el.video.pause();
                     isPreviewing = false;
@@ -243,60 +255,177 @@
         }
     });
 
-    // MP4書き出し処理 (Canvas + MediaRecorder)
+    function seekVideoExact(video, time) {
+        return new Promise((resolve) => {
+            if (Math.abs(video.currentTime - time) < 0.001) {
+                resolve();
+                return;
+            }
+            const onSeeked = () => {
+                video.removeEventListener('seeked', onSeeked);
+                resolve();
+            };
+            video.addEventListener('seeked', onSeeked);
+            video.currentTime = time;
+        });
+    }
+
+    // ⚡ WebCodecs + mp4-muxer による非リアルタイム爆速書き出し
     el.exportBtn.addEventListener('click', async () => {
-        if(keepSegments.length === 0) return;
-        isExporting = true;
-        el.exportBtn.innerText = "録画して書き出し中... (画面を閉じないでください)";
-        el.exportBtn.classList.replace('bg-[#8957e5]', 'bg-gray-600');
-
-        const ctx = el.canvas.getContext('2d');
-        const drawLoop = () => {
-            if(!el.video.paused && !el.video.ended) ctx.drawImage(el.video, 0, 0, el.canvas.width, el.canvas.height);
-            if(isExporting) requestAnimationFrame(drawLoop);
-        };
-
-        const canvasStream = el.canvas.captureStream(30);
-        let audioStream = new MediaStream();
-        try {
-            const actx = new (window.AudioContext || window.webkitAudioContext)();
-            const source = actx.createMediaElementSource(el.video);
-            const dest = actx.createMediaStreamDestination();
-            source.connect(dest);
-            source.connect(actx.destination);
-            audioStream = dest.stream;
-        } catch(e) {
-            if(el.video.captureStream) audioStream = el.video.captureStream();
+        if(keepSegments.length === 0 || isExporting) return;
+        if(!window.VideoEncoder || !window.AudioEncoder) {
+            alert('このブラウザはWebCodecsに非対応です（最新のChrome / Edgeをご利用ください）');
+            return;
         }
 
-        const combinedStream = new MediaStream([...canvasStream.getVideoTracks(), ...audioStream.getAudioTracks()]);
-        const mimeOptions = ['video/mp4;codecs=h264,aac', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'];
-        const mime = mimeOptions.find(m => MediaRecorder.isTypeSupported(m)) || '';
-        const ext = mime.includes('mp4') ? 'mp4' : 'webm';
-        
-        const rec = new MediaRecorder(combinedStream, mime ? {mimeType: mime} : undefined);
-        const chunks = [];
-        rec.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
-        rec.onstop = () => {
-            const blob = new Blob(chunks, { type: mime });
+        isExporting = true;
+        isPreviewing = false;
+        el.video.pause();
+        el.exportBtn.disabled = true;
+        el.exportBtn.innerText = "⚡ WebCodecs 爆速エンコード中...";
+        el.exportProgressWrap.classList.remove('hidden');
+
+        try {
+            const fps = parseInt(el.exportFps.value, 10) || 30;
+            const width = el.canvas.width;
+            const height = el.canvas.height;
+            const sampleRate = audioBuffer.sampleRate;
+            const numChannels = Math.min(2, audioBuffer.numberOfChannels);
+            const ctx = el.canvas.getContext('2d', { alpha: false });
+
+            const muxer = new Muxer({
+                target: new ArrayBufferTarget(),
+                video: { codec: 'avc', width, height },
+                audio: { codec: 'aac', numberOfChannels: numChannels, sampleRate },
+                fastStart: 'in-memory'
+            });
+
+            const videoEncoder = new VideoEncoder({
+                output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+                error: (e) => console.error('VideoEncoder error:', e)
+            });
+
+            videoEncoder.configure({
+                codec: 'avc1.640028',
+                width,
+                height,
+                bitrate: 5_000_000,
+                framerate: fps
+            });
+
+            const audioEncoder = new AudioEncoder({
+                output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+                error: (e) => console.error('AudioEncoder error:', e)
+            });
+
+            audioEncoder.configure({
+                codec: 'mp4a.40.2',
+                numberOfChannels: numChannels,
+                sampleRate,
+                bitrate: 128_000
+            });
+
+            // 1. 残す区間の音声サンプルを結合して一括エンコード
+            const ch0 = audioBuffer.getChannelData(0);
+            const ch1 = numChannels > 1 ? audioBuffer.getChannelData(1) : ch0;
+            let totalAudioSamples = 0;
+            const ranges = keepSegments.map(seg => {
+                const s = Math.max(0, Math.floor(seg.start * sampleRate));
+                const e = Math.min(ch0.length, Math.floor(seg.end * sampleRate));
+                totalAudioSamples += Math.max(0, e - s);
+                return { s, e };
+            });
+
+            const mergedPlanar = new Float32Array(totalAudioSamples * numChannels);
+            let writeOffset = 0;
+            for (const r of ranges) {
+                const len = r.e - r.s;
+                if (len <= 0) continue;
+                mergedPlanar.set(ch0.subarray(r.s, r.e), writeOffset);
+                if (numChannels > 1) {
+                    mergedPlanar.set(ch1.subarray(r.s, r.e), totalAudioSamples + writeOffset);
+                }
+                writeOffset += len;
+            }
+
+            const audioChunkSamples = sampleRate; // 1秒ずつエンコード
+            for (let offset = 0; offset < totalAudioSamples; offset += audioChunkSamples) {
+                const frames = Math.min(audioChunkSamples, totalAudioSamples - offset);
+                const chunkBuf = new Float32Array(frames * numChannels);
+                chunkBuf.set(mergedPlanar.subarray(offset, offset + frames), 0);
+                if (numChannels > 1) {
+                    chunkBuf.set(mergedPlanar.subarray(totalAudioSamples + offset, totalAudioSamples + offset + frames), frames);
+                }
+                const audioData = new AudioData({
+                    format: 'f32-planar',
+                    sampleRate,
+                    numberOfFrames: frames,
+                    numberOfChannels: numChannels,
+                    timestamp: Math.round((offset / sampleRate) * 1_000_000),
+                    data: chunkBuf
+                });
+                audioEncoder.encode(audioData);
+                audioData.close();
+            }
+
+            // 2. 残す区間の映像フレームを高速シークで順番にエンコード
+            const totalDuration = keepSegments.reduce((acc, s) => acc + (s.end - s.start), 0);
+            const totalFrames = Math.max(1, Math.ceil(totalDuration * fps));
+            const frameDurationUs = Math.round(1_000_000 / fps);
+
+            let outFrameIndex = 0;
+            const tStart = performance.now();
+
+            for (const seg of keepSegments) {
+                const segDur = seg.end - seg.start;
+                const segFrames = Math.max(1, Math.round(segDur * fps));
+                for (let f = 0; f < segFrames; f++) {
+                    const srcTime = Math.min(seg.end, seg.start + (f / fps));
+                    await seekVideoExact(el.video, srcTime);
+                    ctx.drawImage(el.video, 0, 0, width, height);
+
+                    const timestampUs = outFrameIndex * frameDurationUs;
+                    const frame = new VideoFrame(el.canvas, {
+                        timestamp: timestampUs,
+                        duration: frameDurationUs
+                    });
+                    videoEncoder.encode(frame, { keyFrame: outFrameIndex % (fps * 2) === 0 });
+                    frame.close();
+
+                    outFrameIndex++;
+                    if (outFrameIndex % 10 === 0) {
+                        const pct = Math.min(99, Math.round((outFrameIndex / totalFrames) * 100));
+                        el.exportProgressBar.style.width = `${pct}%`;
+                        el.exportProgressText.innerText = `${pct}% (${outFrameIndex} / ${totalFrames} frames)`;
+                        if (videoEncoder.encodeQueueSize > 15) {
+                            await videoEncoder.flush();
+                        }
+                    }
+                }
+            }
+
+            await videoEncoder.flush();
+            await audioEncoder.flush();
+            videoEncoder.close();
+            audioEncoder.close();
+            muxer.finalize();
+
+            const { buffer } = muxer.target;
+            const blob = new Blob([buffer], { type: 'video/mp4' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
-            a.download = `clipcutter_export.${ext}`;
+            a.download = `clipcutter_turbo.mp4`;
             a.click();
+
+            const elapsed = ((performance.now() - tStart) / 1000).toFixed(1);
+            el.exportProgressBar.style.width = '100%';
+            el.exportProgressText.innerText = `✅ 完了！ (${elapsed}秒で爆速書き出し成功)`;
+        } catch (err) {
+            alert('書き出しエラー: ' + err.message);
+        } finally {
             isExporting = false;
-            el.exportBtn.innerText = "MP4で書き出す";
-            el.exportBtn.classList.replace('bg-gray-600', 'bg-[#8957e5]');
-        };
-
-        currentSegIndex = 0;
-        el.video.currentTime = keepSegments[0].start;
-        
-        rec.start(100); // 録画開始
-        await el.video.play();
-        drawLoop();
-
-        el.video.onpause = () => {
-            if(isExporting && currentSegIndex >= keepSegments.length) rec.stop();
+            el.exportBtn.disabled = false;
+            el.exportBtn.innerText = "⚡ WebCodecsで爆速MP4書き出し";
         }
     });
 </script>
